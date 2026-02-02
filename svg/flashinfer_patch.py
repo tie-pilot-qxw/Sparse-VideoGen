@@ -35,6 +35,15 @@ def _try_import_triton():
 
         tl.store(kv_indices_ptr + offset, kv_idx, mask=off_mask)
 
+    try:
+        # Triton JITFunction usually stores the original python function in .fn
+        fn = getattr(_svg_kvidx_kernel, "fn", None)
+        g = fn.__globals__ if fn is not None else _svg_kvidx_kernel.__globals__
+        g["tl"] = tl
+        g["triton"] = triton
+    except Exception:
+        pass
+    
     return triton, _svg_kvidx_kernel
 
 
@@ -161,16 +170,7 @@ def _build_patched_plan(orig_plan, logger=None):
     if assign_pat.search(patched):
         patched = assign_pat.sub(r"\g<indent># svg: skip kv_indices_host copy", patched, count=1)
 
-    patched = re.sub(
-        r"(assert\s*\([^)]*)kv_indices_host(\.shape\[0\])",
-        r"\1kv_indices\2",
-        patched,
-    )
-    patched = re.sub(
-        r"(assert\s+[^\n]*?)kv_indices_host(\.shape\[0\])",
-        r"\1kv_indices\2",
-        patched,
-    )
+    patched = re.sub(r"\bkv_indices_host\b", "kv_indices", patched)
 
     triton_mod, kvidx_kernel = _try_import_triton()
     if triton_mod is None and kvidx_kernel is None:
