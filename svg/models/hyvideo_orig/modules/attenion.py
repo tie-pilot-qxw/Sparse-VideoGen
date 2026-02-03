@@ -39,6 +39,8 @@ except ImportError:
 
 import flashinfer
 
+from ....flashinfer_patch import flashinfer_patch_enabled
+
 flex_attention = torch.compile(flex_attention, dynamic=False)
 torch._dynamo.config.cache_size_limit = 192 * 3
 torch._dynamo.config.accumulated_cache_size_limit = 192 * 3
@@ -406,16 +408,17 @@ def flashinfer_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, m
     block_row_sz = block_row_sz.reshape(B * H, qc_num)
     block_col_sz = block_col_sz.reshape(B * H, kc_num)
 
-    wrapper.plan(
-        block_mask_map=block_mask_map,
-        block_row_sz=block_row_sz,
-        block_col_sz=block_col_sz,
-        num_qo_heads=B * H,
-        num_kv_heads=B * H,
-        head_dim=D,
-        q_data_type=q.dtype,
-        kv_data_type=k.dtype,
-    )
+    with flashinfer_patch_enabled():
+        wrapper.plan(
+            block_mask_map=block_mask_map,
+            block_row_sz=block_row_sz,
+            block_col_sz=block_col_sz,
+            num_qo_heads=B * H,
+            num_kv_heads=B * H,
+            head_dim=D,
+            q_data_type=q.dtype,
+            kv_data_type=k.dtype,
+        )
 
     o = wrapper.run(q, k, v)  # [num_qo_heads, qo_len, head_dim]
     o = o.reshape(B, H, S, D)

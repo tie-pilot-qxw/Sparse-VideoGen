@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from cuvs.cluster.kmeans import KMeansParams, fit
 
+from .flashinfer_patch import flashinfer_patch_enabled
 from .timer import time_logging_decorator
 
 # --- New functions ---
@@ -1373,16 +1374,17 @@ def dynamic_block_sparse_fwd_flashinfer(
         block_row_sz = block_row_sz.reshape(B * H, qc_num)
         block_col_sz = block_col_sz.reshape(B * H, kc_num)
 
-        wrapper.plan(
-            block_mask_map=block_mask_map,
-            block_row_sz=block_row_sz,
-            block_col_sz=block_col_sz,
-            num_qo_heads=B * H,
-            num_kv_heads=B * H,
-            head_dim=D,
-            q_data_type=q.dtype,
-            kv_data_type=k.dtype,
-        )
+        with flashinfer_patch_enabled():
+            wrapper.plan(
+                block_mask_map=block_mask_map,
+                block_row_sz=block_row_sz,
+                block_col_sz=block_col_sz,
+                num_qo_heads=B * H,
+                num_kv_heads=B * H,
+                head_dim=D,
+                q_data_type=q.dtype,
+                kv_data_type=k.dtype,
+            )
 
         # print_memory_usage("After plan")
 
