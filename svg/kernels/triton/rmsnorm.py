@@ -13,6 +13,7 @@ def _rms_norm_fwd_fused(
     Rstd,
     x_stride,
     y_stride,
+    M: tl.constexpr,  # number of rows in X,
     N: tl.constexpr,  # number of columns in X,
     N2: tl.constexpr,
     eps,  # epsilon to avoid division by zero
@@ -22,12 +23,15 @@ def _rms_norm_fwd_fused(
     pid = tl.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.arange(0, N2)
-    mask = cols < N
+
+    row_mask = rows < M
+    col_mask = cols < N
+    mask = row_mask[:, None] & col_mask[None, :]
 
     x_ptr = X + rows[:, None] * x_stride + cols[None, :]
     y_ptr = Y + rows[:, None] * y_stride + cols[None, :]
 
-    x = tl.load(x_ptr, mask=mask[None, :], other=0.0).to(tl.float32)
+    x = tl.load(x_ptr, mask=mask, other=0.0).to(tl.float32)
 
     # Compute variance
     _var = x * x
@@ -35,17 +39,17 @@ def _rms_norm_fwd_fused(
     rstd = 1 / tl.sqrt(var + eps)
 
     # Write mean / rstd
-    tl.store(Rstd + rows, rstd)
+    tl.store(Rstd + rows, rstd, mask=row_mask)
     rstd = tl.reshape(rstd, (BLOCK_M, 1))
 
     # Normalize and apply linear transformation
-    w = tl.load(W + cols)
+    w = tl.load(W + cols, mask=col_mask)
     x_hat = x * rstd
     y = x_hat * w
 
     # Write output
     y = y.to(Y.type.element_ty)
-    tl.store(y_ptr, y, mask=mask[None, :])
+    tl.store(y_ptr, y, mask=mask)
 
 
 def triton_rmsnorm_forward(x, w, eps):
@@ -89,6 +93,7 @@ def triton_rmsnorm_forward(x, w, eps):
         rstd,  #
         x.stride(0),
         y.stride(0),
+        M,
         N,
         N2,
         eps,
