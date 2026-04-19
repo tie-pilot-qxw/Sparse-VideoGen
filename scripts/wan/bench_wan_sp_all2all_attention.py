@@ -768,22 +768,45 @@ def run_iteration(local: Dict, args: argparse.Namespace, rank: int, world_size: 
         lambda: apply_inverse_permutation_triton(attn_out_permuted, q_sorted_indices, dim=2), "inverse_permute"
     )
 
-    # Pad attn_out back to the symmetric head count before the reverse all2all.
-    # The pad slots' outputs are junk; downstream is expected to ignore them.
-    if real_count < heads_padded:
-        pad = torch.zeros(
-            attn_out.shape[0],
-            heads_padded - real_count,
-            attn_out.shape[2],
-            attn_out.shape[3],
-            device=attn_out.device,
-            dtype=attn_out.dtype,
-        )
-        attn_out_for_a2a = torch.cat([attn_out, pad], dim=1).contiguous()
-    else:
-        attn_out_for_a2a = attn_out
+    if symm_a2a is not None:
+        # Reverse asymm pull: write attn_out into attn_symm (per-peer S padding),
+        # kernel scatters each global head directly to its slot on every rank.
+        B_, H_loc_, S_full_, D_ = attn_out.shape
+        assert S_full_ == world_size * (S_full_ // world_size)
+        s_real = S_full_ // world_size
+        s_padded = symm_a2a.s_local_padded
+        max_hpr = symm_a2a.max_h_per_rank
+        attn_symm_view = symm_a2a.attn_symm.view(B_, max_hpr, world_size, s_padded, D_)
+        attn_out_view = attn_out.reshape(B_, H_loc_, world_size, s_real, D_)
+        attn_symm_view[:, :H_loc_, :, :s_real, :].copy_(attn_out_view)
 
-    out_seq, all2all_out_events = all2all_heads_to_sequence(attn_out_for_a2a, world_size)
+        num_sms = args.num_sms if args.num_sms > 0 else None
+        out_seq_full, all2all_out_events = record_cuda_region(
+            lambda: symm_a2a.pull_heads_to_seq(num_sms=num_sms),
+            "all2all_heads_to_sequence",
+        )
+        # [B, H_total, s_padded, D] → trim padding to [B, H_total, s_real, D]
+        if s_padded != s_real:
+            out_seq = out_seq_full[:, :, :s_real, :].contiguous()
+        else:
+            out_seq = out_seq_full
+    else:
+        # Pad attn_out back to the symmetric head count before the reverse all2all.
+        # The pad slots' outputs are junk; downstream is expected to ignore them.
+        if real_count < heads_padded:
+            pad = torch.zeros(
+                attn_out.shape[0],
+                heads_padded - real_count,
+                attn_out.shape[2],
+                attn_out.shape[3],
+                device=attn_out.device,
+                dtype=attn_out.dtype,
+            )
+            attn_out_for_a2a = torch.cat([attn_out, pad], dim=1).contiguous()
+        else:
+            attn_out_for_a2a = attn_out
+
+        out_seq, all2all_out_events = all2all_heads_to_sequence(attn_out_for_a2a, world_size)
     density_gpu = density_calculation(dyn_map, qc_sz, kc_sz).reshape(-1).detach().float()
     q_chunk_density_gpu = q_sequence_chunk_density(
         dyn_map,
@@ -1031,8 +1054,10 @@ def main():
         "--asymm-a2a",
         choices=["off", "pull_qkv"],
         default="off",
-        help="Replace the forward seq→heads all2all with a pull-based kernel "
-        "over torch symmetric memory (Triton + TMA). Reverse path unchanged.",
+        help="Replace both forward (seq→heads for Q/K/V) and reverse "
+        "(heads→seq for attn_out) all2alls with pull-based kernels over "
+        "torch symmetric memory (Triton + TMA). Reverse scatters by global "
+        "head index on the fly, so no pad+permute needed.",
     )
     parser.add_argument(
         "--num-sms",
@@ -1141,6 +1166,7 @@ def main():
             dtype=dtype,
             device=device,
             s_block=s_block,
+            h_idxs_all=assigned,
         )
         if rank == 0:
             print(

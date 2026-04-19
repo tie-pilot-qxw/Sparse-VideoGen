@@ -153,6 +153,132 @@ def _run_case(
     torch.cuda.empty_cache()
 
 
+def _invert_assignment(head_assignment, H_TOTAL):
+    """Return (owner_of, local_idx_of) as Python lists of length H_TOTAL."""
+    owner_of = [-1] * H_TOTAL
+    local_idx_of = [-1] * H_TOTAL
+    for p, heads in enumerate(head_assignment):
+        for lh, gh in enumerate(heads):
+            owner_of[int(gh)] = p
+            local_idx_of[int(gh)] = lh
+    missing = [i for i, o in enumerate(owner_of) if o < 0]
+    if missing:
+        raise ValueError(f"head_assignment doesn't cover global heads {missing}")
+    return owner_of, local_idx_of
+
+
+def _run_reverse_case(
+    world_size: int,
+    rank: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    B: int,
+    H_TOTAL: int,
+    S_LOCAL: int,
+    D: int,
+    head_assignment,
+    case_name: str,
+    bw_warmup: int = 5,
+    bw_iters: int = 50,
+):
+    h_local = len(head_assignment[rank])
+    max_hpr = max(len(h) for h in head_assignment)
+    owner_of, local_idx_of = _invert_assignment(head_assignment, H_TOTAL)
+    s_full = world_size * S_LOCAL
+
+    a2a = SymmAsymA2A(
+        dist.group.WORLD,
+        buffer_shape=(B, H_TOTAL, S_LOCAL, D),
+        dtype=dtype,
+        device=device,
+        s_block=min(128, S_LOCAL),
+        h_idxs_all=head_assignment,
+    )
+
+    # Fill attn_symm on every rank with a unique integer pattern.
+    # val[src_rank, local_h, s_full_idx] = (src_rank * max_hpr + local_h) * s_full + s_full_idx
+    # We fill ALL rows (including the pad rows beyond h_local) so the kernel
+    # reading a pad row by mistake would still produce a detectable mismatch.
+    buf = a2a.attn_symm
+    lh_axis = torch.arange(max_hpr, device=device, dtype=torch.float32).view(1, max_hpr, 1, 1)
+    s_axis = torch.arange(s_full, device=device, dtype=torch.float32).view(1, 1, s_full, 1)
+    encoded = (rank * max_hpr + lh_axis) * s_full + s_axis  # [1, max_hpr, s_full, 1]
+    buf.copy_(encoded.to(buf.dtype).expand(B, max_hpr, s_full, D).contiguous())
+
+    dist.barrier()
+
+    out = a2a.pull_heads_to_seq()  # [B, H_TOTAL, S_LOCAL, D]
+
+    # Expected: for each gh, pull from owner_of[gh] at local_idx_of[gh], seq slice [rank*S_LOCAL : (rank+1)*S_LOCAL].
+    owner_t = torch.tensor(owner_of, device=device, dtype=torch.float32).view(1, H_TOTAL, 1, 1)
+    local_t = torch.tensor(local_idx_of, device=device, dtype=torch.float32).view(1, H_TOTAL, 1, 1)
+    s_local_axis = torch.arange(S_LOCAL, device=device, dtype=torch.float32).view(1, 1, S_LOCAL, 1)
+    expected_f = (owner_t * max_hpr + local_t) * s_full + (rank * S_LOCAL + s_local_axis)
+    expected = expected_f.to(dtype).expand(B, H_TOTAL, S_LOCAL, D).contiguous()
+
+    diff = (out.float() - expected.float()).abs()
+    max_diff = float(diff.max().item())
+    ok = max_diff < 0.5
+    if rank == 0:
+        tag = f"[{case_name} | reverse] rank={rank} h_idxs={head_assignment[rank]}"
+        if ok:
+            print(f"PASS {tag}  max_diff={max_diff}")
+        else:
+            off = int(diff.argmax().item())
+            _, h_dim, s_dim, d_dim = out.shape
+            d_idx = off % d_dim
+            s_idx = (off // d_dim) % s_dim
+            gh_idx = (off // (d_dim * s_dim)) % h_dim
+            got = float(out.float().flatten()[off].item())
+            exp = float(expected.float().flatten()[off].item())
+            print(
+                f"FAIL {tag}  max_diff={max_diff}  "
+                f"gh={gh_idx} s={s_idx} d={d_idx}  expected={exp} got={got}"
+            )
+    dist.barrier()
+
+    # --- reverse bandwidth: each rank reads H_TOTAL * S_LOCAL * D elements;
+    # (H_TOTAL - h_local) heads come from remote peers over NVLink.
+    elem_size = torch.tensor([], dtype=dtype).element_size()
+    bytes_remote = (H_TOTAL - h_local) * B * S_LOCAL * D * elem_size
+    bytes_total  =  H_TOTAL             * B * S_LOCAL * D * elem_size
+
+    for _ in range(bw_warmup):
+        a2a.pull_heads_to_seq()
+    torch.cuda.synchronize(device)
+    dist.barrier()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(bw_iters):
+        a2a.pull_heads_to_seq()
+    end.record()
+    torch.cuda.synchronize(device)
+    per_pull_ms = start.elapsed_time(end) / bw_iters
+
+    bw_remote_gbs = bytes_remote / (per_pull_ms * 1e-3) / 1e9
+    bw_total_gbs  = bytes_total  / (per_pull_ms * 1e-3) / 1e9
+
+    stats = torch.tensor([per_pull_ms, bw_remote_gbs, bw_total_gbs, float(h_local)],
+                         device=device, dtype=torch.float64)
+    gathered = [torch.empty_like(stats) for _ in range(world_size)] if rank == 0 else None
+    dist.gather(stats, gathered, dst=0)
+    if rank == 0:
+        print(f"[{case_name} | bw reverse] per-pull, bytes include {world_size} peers "
+              f"(H_TOTAL={H_TOTAL} gathered, S_LOCAL={S_LOCAL}, D={D}, dtype={dtype}):")
+        print(f"  {'rank':>4}  {'H_loc':>5}  {'ms/pull':>8}  "
+              f"{'remote GB/s':>12}  {'total GB/s':>11}")
+        for r, row in enumerate(gathered):
+            ms, rbw, tbw, hl = row.tolist()
+            print(f"  {r:>4}  {int(hl):>5}  {ms:>8.3f}  {rbw:>12.1f}  {tbw:>11.1f}")
+    dist.barrier()
+
+    del a2a
+    torch.cuda.empty_cache()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", choices=["all", "equal", "skewed", "scattered"], default="all")
@@ -163,6 +289,9 @@ def main():
                              "S_LOCAL=8192, D=128 (close to WAN workload).")
     parser.add_argument("--bw-warmup", type=int, default=5)
     parser.add_argument("--bw-iters", type=int, default=50)
+    parser.add_argument("--dir", choices=["fwd", "rev", "both"], default="both",
+                        help="Which direction to test: fwd (seq→heads), rev "
+                             "(heads→seq), or both.")
     args = parser.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -183,6 +312,18 @@ def main():
                 "(peak value ≈ 4e5). Use bf16 or fp32."
             )
 
+    def _dispatch(assignment, case_name):
+        kw = dict(
+            world_size=world_size, rank=rank, device=device, dtype=dtype,
+            B=B, H_TOTAL=H_TOTAL, S_LOCAL=S_LOCAL, D=D,
+            bw_warmup=args.bw_warmup, bw_iters=args.bw_iters,
+            head_assignment=assignment, case_name=case_name,
+        )
+        if args.dir in ("fwd", "both"):
+            _run_case(**kw)
+        if args.dir in ("rev", "both"):
+            _run_reverse_case(**kw)
+
     # Case 1: equal split (H_TOTAL=12, world=4 → 3 heads each).
     if args.cases in ("all", "equal"):
         if world_size == 4:
@@ -191,10 +332,7 @@ def main():
             assignment = [[0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11]]
         else:
             raise SystemExit(f"test supports world_size ∈ {{2, 4}}, got {world_size}")
-        _run_case(world_size, rank, device, dtype,
-                  B=B, H_TOTAL=H_TOTAL, S_LOCAL=S_LOCAL, D=D,
-                  bw_warmup=args.bw_warmup, bw_iters=args.bw_iters,
-                  head_assignment=assignment, case_name="equal")
+        _dispatch(assignment, "equal")
 
     # Case 2: skewed LPT-style assignment.
     if args.cases in ("all", "skewed"):
@@ -203,10 +341,7 @@ def main():
             assignment = [[7], [0, 11], [1, 3, 5, 9], [2, 4, 6, 8, 10]]
         elif world_size == 2:
             assignment = [[0, 3, 7], [1, 2, 4, 5, 6, 8, 9, 10, 11]]
-        _run_case(world_size, rank, device, dtype,
-                  B=B, H_TOTAL=H_TOTAL, S_LOCAL=S_LOCAL, D=D,
-                  bw_warmup=args.bw_warmup, bw_iters=args.bw_iters,
-                  head_assignment=assignment, case_name="skewed")
+        _dispatch(assignment, "skewed")
 
     # Case 3: scattered (non-monotone) indices.
     if args.cases in ("all", "scattered"):
@@ -214,10 +349,7 @@ def main():
             assignment = [[11, 0, 5], [7, 2, 9], [1, 8, 4], [10, 3, 6]]
         elif world_size == 2:
             assignment = [[11, 0, 5, 7, 2, 9], [1, 8, 4, 10, 3, 6]]
-        _run_case(world_size, rank, device, dtype,
-                  B=B, H_TOTAL=H_TOTAL, S_LOCAL=S_LOCAL, D=D,
-                  bw_warmup=args.bw_warmup, bw_iters=args.bw_iters,
-                  head_assignment=assignment, case_name="scattered")
+        _dispatch(assignment, "scattered")
 
     dist.barrier()
     if rank == 0:
