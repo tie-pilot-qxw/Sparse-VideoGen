@@ -22,6 +22,11 @@ from ...kmeans_utils import (
     identify_dynamic_map,
 )
 from ...logger import logger
+from ...maskgen_export import (
+    get_wan_sap_linear_step,
+    maybe_export_wan_attention_core_inputs,
+    maybe_export_wan_semantic_aware_permutation_inputs,
+)
 from ...timer import time_logging_decorator
 from ...utils.misc import Color
 from .placement import (
@@ -445,8 +450,11 @@ class WanAttn_SAPAttn_Processor(WanAttn_SVGAttn_Processor2_0):
         return qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter
 
     @time_logging_decorator("Level 3 - semantic aware permutation")
-    def semantic_aware_permutation(self, query, key, value):
+    def semantic_aware_permutation(self, query, key, value, timestep=None, linear_step=None):
         cfg, num_heads, seq_len, dim = query.size()
+        maybe_export_wan_semantic_aware_permutation_inputs(
+            self, query, key, value, timestep=timestep, linear_step=linear_step
+        )
 
         # 1. Kmeans clustering
         qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter = self.kmeans_clustering(
@@ -500,6 +508,7 @@ class WanAttn_SAPAttn_Processor(WanAttn_SVGAttn_Processor2_0):
     def attention_core_logic(self, query, key, value, timestep):
         cfg, num_heads, seq_len, dim = query.size()
         assert cfg == 1, "Batch size must be 1 for kmeans block sparse attention"
+        linear_step = get_wan_sap_linear_step(timestep)
 
         context_length, num_frame, frame_size = self.context_length, self.num_frame, self.frame_size
 
@@ -515,6 +524,16 @@ class WanAttn_SAPAttn_Processor(WanAttn_SVGAttn_Processor2_0):
         if timestep[0] > self.first_times_fp:
             full_attention_flag = True
 
+        maybe_export_wan_attention_core_inputs(
+            self,
+            query,
+            key,
+            value,
+            timestep=timestep,
+            linear_step=linear_step,
+            full_attention_flag=full_attention_flag,
+        )
+
         if full_attention_flag:
             if self.zero_step_kmeans_init:
                 video_length = self.num_frame * self.frame_size
@@ -528,7 +547,7 @@ class WanAttn_SAPAttn_Processor(WanAttn_SVGAttn_Processor2_0):
 
         else:
             q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices = self.semantic_aware_permutation(
-                query, key, value
+                query, key, value, timestep=timestep, linear_step=linear_step
             )
 
             output_permuted = dynamic_block_sparse_fwd_flashinfer(
