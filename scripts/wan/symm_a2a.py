@@ -138,17 +138,33 @@ class SymmAsymA2A:
     def peer_ptrs(self, name: str) -> torch.Tensor:
         return self._peer_ptrs[name]
 
+    def barrier(self, channel: int = 0) -> None:
+        """Group-wide symm-mem barrier. `handle.barrier()` syncs the whole
+        process group regardless of which buffer's handle is used, so we pick
+        `q_handle` arbitrarily. Callers use this to amortize sync across the
+        three Q/K/V pulls (one setup barrier is enough when Q/K/V are
+        write-once), or to sequence attn_symm write → rev pull.
+        """
+        self.q_handle.barrier(channel=channel)
+
     def pull_seq_to_heads(
         self,
         name: str,
         h_idxs_r: torch.Tensor,
         num_sms: Optional[int] = None,
         out: Optional[torch.Tensor] = None,
+        pre_barrier: bool = True,
+        post_barrier: bool = True,
     ) -> torch.Tensor:
         """Pull this rank's heads (`h_idxs_r`, global head indices) from every
         peer's `{name}_symm` buffer. Returns `[B, H_local_r, WORLD*S_local, D]`.
 
         Pre-condition: caller has populated `self.{name}_symm` on every rank.
+
+        `pre_barrier`/`post_barrier` default True for drop-in correctness.
+        Disable both when the caller has already established visibility via
+        `self.barrier()` (e.g. Q/K/V are write-once, so one external barrier
+        after setup covers all per-iter pulls).
         """
         if name not in self._handle:
             raise KeyError(f"unknown buffer {name!r}; expected one of q/k/v")
@@ -167,8 +183,8 @@ class SymmAsymA2A:
                 dtype=self.dtype, device=self.device,
             )
 
-        # Pre-barrier: make all peers' writes visible.
-        handle.barrier(channel=0)
+        if pre_barrier:
+            handle.barrier(channel=0)
 
         asymm_pull_seq_to_heads(
             peer_ptrs=peer_ptrs,
@@ -184,15 +200,16 @@ class SymmAsymA2A:
             num_sms=num_sms,
         )
 
-        # Post-barrier: don't let anyone overwrite their symm buffer while we
-        # (or other peers) are still reading.
-        handle.barrier(channel=0)
+        if post_barrier:
+            handle.barrier(channel=0)
         return out
 
     def pull_heads_to_seq(
         self,
         num_sms: Optional[int] = None,
         out: Optional[torch.Tensor] = None,
+        pre_barrier: bool = True,
+        post_barrier: bool = True,
     ) -> torch.Tensor:
         """Reverse pull: scatter this rank's sequence slice of every global
         head from the peer that owns it. Returns `[B, H_total, S_local_padded, D]`
@@ -202,6 +219,10 @@ class SymmAsymA2A:
         (shape `[B, max_H_per_rank, WORLD * S_local_padded, D]`) on every rank,
         with the per-peer S segment padded at its tail, i.e. real data lives
         at `attn_symm.view(B, max_H, WORLD, S_padded, D)[:, :H_local_r, :, :S_real, :]`.
+
+        `pre_barrier`/`post_barrier` default True for drop-in correctness.
+        Disable and inject `self.barrier()` around the attn_symm write when
+        running the fused low-sync path.
         """
         if self.attn_symm is None:
             raise RuntimeError(
@@ -215,7 +236,8 @@ class SymmAsymA2A:
                 dtype=self.dtype, device=self.device,
             )
 
-        self.attn_handle.barrier(channel=0)
+        if pre_barrier:
+            self.attn_handle.barrier(channel=0)
 
         asymm_pull_heads_to_seq(
             peer_ptrs=self.attn_peer_ptrs,
@@ -233,5 +255,6 @@ class SymmAsymA2A:
             num_sms=num_sms,
         )
 
-        self.attn_handle.barrier(channel=0)
+        if post_barrier:
+            self.attn_handle.barrier(channel=0)
         return out

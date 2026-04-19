@@ -691,11 +691,17 @@ def run_iteration(local: Dict, args: argparse.Namespace, rank: int, world_size: 
     symm_a2a = local.get("symm_a2a")
     if symm_a2a is not None:
         # Asymmetric pull: no permute needed, kernel gathers by global head idx.
+        # Low-sync path: Q/K/V are write-once (populated in load_local_shards
+        # and guarded by a one-time setup barrier in main). Per-iter pulls run
+        # barrier-free; visibility is already established.
         h_idxs_r = local["h_idxs_r"]
         num_sms = args.num_sms if args.num_sms > 0 else None
 
         def _pull(name: str):
-            return symm_a2a.pull_seq_to_heads(name, h_idxs_r, num_sms=num_sms)
+            return symm_a2a.pull_seq_to_heads(
+                name, h_idxs_r, num_sms=num_sms,
+                pre_barrier=False, post_barrier=False,
+            )
 
         q_head_full, q_a2a_events = record_cuda_region(
             lambda: _pull("q"), "all2all_sequence_to_heads",
@@ -781,9 +787,18 @@ def run_iteration(local: Dict, args: argparse.Namespace, rank: int, world_size: 
         attn_symm_view[:, :H_loc_, :, :s_real, :].copy_(attn_out_view)
 
         num_sms = args.num_sms if args.num_sms > 0 else None
+
+        # One barrier sequences attn_symm write → rev pull. No post-barrier:
+        # the `dist.barrier()` at the end of each outer iter guarantees peers
+        # finish reading attn_symm before the next iter's write overwrites it.
+        def _rev_pull():
+            symm_a2a.barrier()
+            return symm_a2a.pull_heads_to_seq(
+                num_sms=num_sms, pre_barrier=False, post_barrier=False,
+            )
+
         out_seq_full, all2all_out_events = record_cuda_region(
-            lambda: symm_a2a.pull_heads_to_seq(num_sms=num_sms),
-            "all2all_heads_to_sequence",
+            _rev_pull, "all2all_heads_to_sequence",
         )
         # [B, H_total, s_padded, D] → trim padding to [B, H_total, s_real, D]
         if s_padded != s_real:
@@ -1185,6 +1200,12 @@ def main():
         h_idxs_r=h_idxs_r_asymm,
         max_heads_per_rank=max_hpr_asymm,
     )
+    # One-time Q/K/V visibility barrier. With pre/post barriers removed from
+    # per-iter pulls, every iter relies on this single symm-mem barrier to
+    # make peers' one-shot Q/K/V writes visible. Q/K/V are never rewritten,
+    # so this is sufficient for the whole run.
+    if symm_a2a is not None:
+        symm_a2a.barrier()
     dist.barrier()
 
     for _ in range(args.warmup):
