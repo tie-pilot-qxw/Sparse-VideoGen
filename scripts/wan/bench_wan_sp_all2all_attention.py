@@ -775,30 +775,35 @@ def run_iteration(local: Dict, args: argparse.Namespace, rank: int, world_size: 
     )
 
     if symm_a2a is not None:
-        # Reverse asymm pull: write attn_out into attn_symm (per-peer S padding),
-        # kernel scatters each global head directly to its slot on every rank.
+        # Reverse asymm push: stage attn_out into a local padded buffer
+        # ([B, H_local, world * s_padded, D]) and let the push kernel
+        # deposit each global head directly on the rank that owns the seq
+        # shard. Push needs only ONE barrier (after the kernel) — no
+        # mid-iter sync between local-attn-finish and peer reads.
         B_, H_loc_, S_full_, D_ = attn_out.shape
         assert S_full_ == world_size * (S_full_ // world_size)
         s_real = S_full_ // world_size
         s_padded = symm_a2a.s_local_padded
-        max_hpr = symm_a2a.max_h_per_rank
-        attn_symm_view = symm_a2a.attn_symm.view(B_, max_hpr, world_size, s_padded, D_)
-        attn_out_view = attn_out.reshape(B_, H_loc_, world_size, s_real, D_)
-        attn_symm_view[:, :H_loc_, :, :s_real, :].copy_(attn_out_view)
+        if s_padded != s_real:
+            attn_src_padded = torch.empty(
+                B_, H_loc_, world_size * s_padded, D_,
+                dtype=attn_out.dtype, device=attn_out.device,
+            )
+            attn_src_view = attn_src_padded.view(B_, H_loc_, world_size, s_padded, D_)
+            attn_out_view = attn_out.reshape(B_, H_loc_, world_size, s_real, D_)
+            attn_src_view[:, :, :, :s_real, :].copy_(attn_out_view)
+        else:
+            attn_src_padded = attn_out.contiguous()
 
         num_sms = args.num_sms if args.num_sms > 0 else None
-
-        # One barrier sequences attn_symm write → rev pull. No post-barrier:
-        # the `dist.barrier()` at the end of each outer iter guarantees peers
-        # finish reading attn_symm before the next iter's write overwrites it.
-        def _rev_pull():
-            symm_a2a.barrier()
-            return symm_a2a.pull_heads_to_seq(
-                num_sms=num_sms, pre_barrier=False, post_barrier=False,
-            )
+        h_idxs_r = local["h_idxs_r"]
 
         out_seq_full, all2all_out_events = record_cuda_region(
-            _rev_pull, "all2all_heads_to_sequence",
+            lambda: symm_a2a.push_heads_to_seq(
+                attn_src_padded, h_idxs_r, num_sms=num_sms,
+                pre_barrier=False, post_barrier=True,
+            ),
+            "all2all_heads_to_sequence",
         )
         # [B, H_total, s_padded, D] → trim padding to [B, H_total, s_real, D]
         if s_padded != s_real:
@@ -1081,6 +1086,23 @@ def main():
         help="Persistent kernel grid size. 0 = device SM count.",
     )
     parser.add_argument(
+        "--sim-world",
+        type=int,
+        default=0,
+        help="2-GPU N-rank simulation. When >0, real PG must have world_size=2 "
+        "and --asymm-a2a=pull_qkv. Each real GPU plays one sim rank from a "
+        "world of this size; cross-rank traffic funnels onto the single real "
+        "NVLink pair so cross-rank throughput is roughly (sim_world-1)x "
+        "slower than the real configuration (latency / SMs / sync surface "
+        "area stay accurate). 0 = off.",
+    )
+    parser.add_argument(
+        "--sim-ranks",
+        default=None,
+        help="Comma-separated `r0,r1` picking which sim ranks the two real "
+        "GPUs play. Default: `0,sim_world-1`. Ignored without --sim-world.",
+    )
+    parser.add_argument(
         "--s-block",
         type=int,
         default=0,
@@ -1101,6 +1123,42 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
+    # 2-GPU N-rank simulation: real PG stays at world_size=2, but everything
+    # downstream of head/seq sharding (and the symm-mem kernels) sees
+    # `effective_world` ranks. Real `world_size` / `rank` are still used for
+    # dist primitives (init/barrier/gather) and for the device assignment.
+    if args.sim_world > 0:
+        if args.asymm_a2a != "pull_qkv":
+            raise SystemExit("--sim-world requires --asymm-a2a pull_qkv")
+        if world_size != 2:
+            raise SystemExit(
+                f"--sim-world requires real world_size=2, got {world_size}"
+            )
+        if args.sim_ranks:
+            sim_ranks = [int(x) for x in args.sim_ranks.split(",")]
+            if len(sim_ranks) != 2:
+                raise SystemExit(f"--sim-ranks must list 2 ints, got {sim_ranks}")
+        else:
+            sim_ranks = [0, args.sim_world - 1]
+        for sr in sim_ranks:
+            if not (0 <= sr < args.sim_world):
+                raise SystemExit(
+                    f"--sim-ranks {sim_ranks} out of [0, {args.sim_world})"
+                )
+        if sim_ranks[0] == sim_ranks[1]:
+            raise SystemExit(f"--sim-ranks must be distinct, got {sim_ranks}")
+        effective_world = args.sim_world
+        effective_rank = sim_ranks[rank]
+        if rank == 0:
+            print(
+                f"[sim_world={effective_world}] real rank 0 ↔ sim_rank "
+                f"{sim_ranks[0]}, real rank 1 ↔ sim_rank {sim_ranks[1]}; "
+                f"cross-rank bandwidth pessimistic by ≈{effective_world - 1}x"
+            )
+    else:
+        effective_world = world_size
+        effective_rank = rank
+
     if args.balance in ("greedy", "greedy_unequal") and args.density_log is None:
         raise SystemExit(f"--balance {args.balance} requires --density-log")
     cost_model = load_cost_model(args.cost_model_json)
@@ -1120,9 +1178,9 @@ def main():
             args.density_log,
             peek_metadata,
             num_heads,
-            world_size,
+            effective_world,
             strategy=args.balance,
-            rank=rank,
+            rank=effective_rank,
             min_heads_per_rank=args.min_heads_per_rank,
             cost_model=cost_model,
         )
@@ -1153,12 +1211,15 @@ def main():
             dtype = peek["inputs"]["query"].dtype
             del peek
             gc.collect()
-            if num_heads % world_size != 0:
+            if num_heads % effective_world != 0:
                 raise SystemExit(
-                    f"contiguous balance + asymm requires num_heads ({num_heads}) divisible by world_size"
+                    f"contiguous balance + asymm requires num_heads ({num_heads}) "
+                    f"divisible by effective_world ({effective_world})"
                 )
-            hpr = num_heads // world_size
-            assigned = [list(range(r * hpr, (r + 1) * hpr)) for r in range(world_size)]
+            hpr = num_heads // effective_world
+            assigned = [
+                list(range(r * hpr, (r + 1) * hpr)) for r in range(effective_world)
+            ]
         else:
             peek = torch.load(args.input, map_location="cpu", weights_only=False)
             cfg, num_heads, seq_len, dim = peek["inputs"]["query"].shape
@@ -1166,14 +1227,18 @@ def main():
             del peek
             gc.collect()
 
-        h_idxs_r_asymm = assigned[rank]
+        h_idxs_r_asymm = assigned[effective_rank]
         max_hpr_asymm = max(len(h) for h in assigned)
-        s_local_real = seq_len // world_size
+        s_local_real = seq_len // effective_world
         s_block = args.s_block if args.s_block > 0 else pick_s_block(s_local_real)
         if s_block <= 0 or (s_block & (s_block - 1)) != 0:
             raise SystemExit(
                 f"--s-block must be a power of 2, got {s_block}"
             )
+
+        sim_kw = {}
+        if args.sim_world > 0:
+            sim_kw = {"sim_world": effective_world, "sim_rank": effective_rank}
 
         symm_a2a = SymmAsymA2A(
             dist.group.WORLD,
@@ -1181,20 +1246,22 @@ def main():
             dtype=dtype,
             device=device,
             s_block=s_block,
-            h_idxs_all=assigned,
+            enable_reverse=True,
+            **sim_kw,
         )
         if rank == 0:
             print(
                 f"[asymm_a2a=pull_qkv] symm buffers [{cfg},{num_heads},{s_local_real},{dim}] "
                 f"dtype={dtype} s_block={s_block} num_sms={args.num_sms or 'auto'}; "
-                f"per-rank heads={[len(h) for h in assigned]} max_hpr={max_hpr_asymm}"
+                f"per-rank heads={[len(h) for h in assigned]} max_hpr={max_hpr_asymm} "
+                f"effective_world={effective_world}"
             )
         # Asymm path drives its own Q/K/V — don't also pad+permute in load_local_shards.
         head_order = None
         real_heads_per_rank = None
 
     local = load_local_shards(
-        args.input, rank, world_size, device,
+        args.input, effective_rank, effective_world, device,
         head_order=head_order, real_heads_per_rank=real_heads_per_rank,
         symm_a2a=symm_a2a,
         h_idxs_r=h_idxs_r_asymm,
@@ -1209,7 +1276,7 @@ def main():
     dist.barrier()
 
     for _ in range(args.warmup):
-        run_iteration(local, args, rank, world_size, device)
+        run_iteration(local, args, effective_rank, effective_world, device)
         dist.barrier()
         torch.cuda.empty_cache()
 
@@ -1227,7 +1294,7 @@ def main():
     q_chunk_density_rows = []
     with profiler_ctx as prof:
         for _ in range(args.iters):
-            metrics, densities, q_chunk_densities = run_iteration(local, args, rank, world_size, device)
+            metrics, densities, q_chunk_densities = run_iteration(local, args, effective_rank, effective_world, device)
             rank_rows.append(metrics)
             density_rows.extend(densities)
             q_chunk_density_rows.extend(q_chunk_densities)
@@ -1283,7 +1350,7 @@ def main():
                 actual[int(row["rank"])] += float(row["density"])
             # each rank logs densities per iteration, so average across iters
             iters = max(1, args.iters)
-            actual_loads = [actual[r] / iters for r in range(world_size)]
+            actual_loads = [actual[r] / iters for r in range(effective_world)]
             print(
                 f"actual per-rank density (mean across {iters} iters): "
                 f"{[round(x, 4) for x in actual_loads]} max/min={_ratio(actual_loads):.3f}"

@@ -1,13 +1,14 @@
-"""Correctness harness for `SymmAsymA2A.pull_seq_to_heads`.
+"""Correctness harness for `SymmAsymA2A.pull_seq_to_heads` (forward) and
+`SymmAsymA2A.push_heads_to_seq` (reverse).
 
 Launch with:
 
     torchrun --nproc_per_node=2 scripts/wan/test_asymm_pull.py
     torchrun --nproc_per_node=4 scripts/wan/test_asymm_pull.py --cases all
 
-Fills each rank's symm buffer with a deterministic pattern
-`rank * 1e6 + head * 1e3 + seq_idx` so that any miswired pull shows up as
-a specific integer mismatch (printable, not a random float blob).
+Fills each rank's source buffer with a deterministic integer pattern so that
+any miswired transfer shows up as a specific integer mismatch (printable, not
+a random float blob).
 """
 
 from __future__ import annotations
@@ -182,7 +183,8 @@ def _run_reverse_case(
     bw_warmup: int = 5,
     bw_iters: int = 50,
 ):
-    h_local = len(head_assignment[rank])
+    h_idxs_r = torch.tensor(head_assignment[rank], dtype=torch.int32, device=device)
+    h_local = h_idxs_r.numel()
     max_hpr = max(len(h) for h in head_assignment)
     owner_of, local_idx_of = _invert_assignment(head_assignment, H_TOTAL)
     s_full = world_size * S_LOCAL
@@ -193,24 +195,31 @@ def _run_reverse_case(
         dtype=dtype,
         device=device,
         s_block=min(128, S_LOCAL),
-        h_idxs_all=head_assignment,
+        enable_reverse=True,
     )
 
-    # Fill attn_symm on every rank with a unique integer pattern.
-    # val[src_rank, local_h, s_full_idx] = (src_rank * max_hpr + local_h) * s_full + s_full_idx
-    # We fill ALL rows (including the pad rows beyond h_local) so the kernel
-    # reading a pad row by mistake would still produce a detectable mismatch.
-    buf = a2a.attn_symm
-    lh_axis = torch.arange(max_hpr, device=device, dtype=torch.float32).view(1, max_hpr, 1, 1)
-    s_axis = torch.arange(s_full, device=device, dtype=torch.float32).view(1, 1, s_full, 1)
-    encoded = (rank * max_hpr + lh_axis) * s_full + s_axis  # [1, max_hpr, s_full, 1]
-    buf.copy_(encoded.to(buf.dtype).expand(B, max_hpr, s_full, D).contiguous())
+    # Local source buffer: [B, h_local, world * s_padded, D]. Encoded so that
+    # src[b, lh, p*s_padded + s, d] = (rank * max_hpr + lh) * s_full + p*S_LOCAL + s
+    # for s in [0, S_LOCAL). Pad slots [S_LOCAL, s_padded) carry junk values
+    # that the kernel will faithfully copy but the receiver never reads.
+    s_padded = a2a.s_local_padded
+    src = torch.zeros(B, h_local, world_size * s_padded, D, dtype=dtype, device=device)
+    lh_axis = torch.arange(h_local, device=device, dtype=torch.float32).view(1, h_local, 1, 1)
+    s_axis = torch.arange(S_LOCAL, device=device, dtype=torch.float32).view(1, 1, S_LOCAL, 1)
+    for p in range(world_size):
+        vals = (rank * max_hpr + lh_axis) * s_full + (p * S_LOCAL + s_axis)
+        src[:, :, p * s_padded : p * s_padded + S_LOCAL, :] = (
+            vals.to(dtype).expand(B, h_local, S_LOCAL, D)
+        )
 
     dist.barrier()
 
-    out = a2a.pull_heads_to_seq()  # [B, H_TOTAL, S_LOCAL, D]
+    out_full = a2a.push_heads_to_seq(src, h_idxs_r)  # [B, H_TOTAL, s_padded, D]
+    out = out_full[:, :, :S_LOCAL, :].contiguous()
 
-    # Expected: for each gh, pull from owner_of[gh] at local_idx_of[gh], seq slice [rank*S_LOCAL : (rank+1)*S_LOCAL].
+    # Expected: out[b, gh, s, d] is whatever the OWNER of gh pushed at peer
+    # slot `rank` (this rank's seq shard), local head `local_idx_of[gh]`.
+    #   = (owner_of[gh] * max_hpr + local_idx_of[gh]) * s_full + rank*S_LOCAL + s
     owner_t = torch.tensor(owner_of, device=device, dtype=torch.float32).view(1, H_TOTAL, 1, 1)
     local_t = torch.tensor(local_idx_of, device=device, dtype=torch.float32).view(1, H_TOTAL, 1, 1)
     s_local_axis = torch.arange(S_LOCAL, device=device, dtype=torch.float32).view(1, 1, S_LOCAL, 1)
@@ -221,7 +230,7 @@ def _run_reverse_case(
     max_diff = float(diff.max().item())
     ok = max_diff < 0.5
     if rank == 0:
-        tag = f"[{case_name} | reverse] rank={rank} h_idxs={head_assignment[rank]}"
+        tag = f"[{case_name} | reverse-push] rank={rank} h_idxs={head_assignment[rank]}"
         if ok:
             print(f"PASS {tag}  max_diff={max_diff}")
         else:
@@ -238,14 +247,14 @@ def _run_reverse_case(
             )
     dist.barrier()
 
-    # --- reverse bandwidth: each rank reads H_TOTAL * S_LOCAL * D elements;
-    # (H_TOTAL - h_local) heads come from remote peers over NVLink.
+    # --- reverse bandwidth: each rank pushes h_local heads' rows to ALL
+    # peers; (world-1)/world goes over NVLink (one slab is the local self-push).
     elem_size = torch.tensor([], dtype=dtype).element_size()
-    bytes_remote = (H_TOTAL - h_local) * B * S_LOCAL * D * elem_size
-    bytes_total  =  H_TOTAL             * B * S_LOCAL * D * elem_size
+    bytes_remote = h_local * (world_size - 1) * B * S_LOCAL * D * elem_size
+    bytes_total  = h_local *  world_size      * B * S_LOCAL * D * elem_size
 
     for _ in range(bw_warmup):
-        a2a.pull_heads_to_seq()
+        a2a.push_heads_to_seq(src, h_idxs_r)
     torch.cuda.synchronize(device)
     dist.barrier()
 
@@ -253,22 +262,22 @@ def _run_reverse_case(
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(bw_iters):
-        a2a.pull_heads_to_seq()
+        a2a.push_heads_to_seq(src, h_idxs_r)
     end.record()
     torch.cuda.synchronize(device)
-    per_pull_ms = start.elapsed_time(end) / bw_iters
+    per_push_ms = start.elapsed_time(end) / bw_iters
 
-    bw_remote_gbs = bytes_remote / (per_pull_ms * 1e-3) / 1e9
-    bw_total_gbs  = bytes_total  / (per_pull_ms * 1e-3) / 1e9
+    bw_remote_gbs = bytes_remote / (per_push_ms * 1e-3) / 1e9
+    bw_total_gbs  = bytes_total  / (per_push_ms * 1e-3) / 1e9
 
-    stats = torch.tensor([per_pull_ms, bw_remote_gbs, bw_total_gbs, float(h_local)],
+    stats = torch.tensor([per_push_ms, bw_remote_gbs, bw_total_gbs, float(h_local)],
                          device=device, dtype=torch.float64)
     gathered = [torch.empty_like(stats) for _ in range(world_size)] if rank == 0 else None
     dist.gather(stats, gathered, dst=0)
     if rank == 0:
-        print(f"[{case_name} | bw reverse] per-pull, bytes include {world_size} peers "
-              f"(H_TOTAL={H_TOTAL} gathered, S_LOCAL={S_LOCAL}, D={D}, dtype={dtype}):")
-        print(f"  {'rank':>4}  {'H_loc':>5}  {'ms/pull':>8}  "
+        print(f"[{case_name} | bw reverse-push] per-push, bytes include {world_size} peers "
+              f"(h_local rows pushed to each, S_LOCAL={S_LOCAL}, D={D}, dtype={dtype}):")
+        print(f"  {'rank':>4}  {'H_loc':>5}  {'ms/push':>8}  "
               f"{'remote GB/s':>12}  {'total GB/s':>11}")
         for r, row in enumerate(gathered):
             ms, rbw, tbw, hl = row.tolist()
